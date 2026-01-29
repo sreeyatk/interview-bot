@@ -1,14 +1,16 @@
 import { useState, useEffect, useCallback } from "react";
 import { motion, AnimatePresence } from "framer-motion";
-import { Mic, MicOff, Volume2, Loader2, ArrowRight, User, Sparkles } from "lucide-react";
+import { Mic, MicOff, Volume2, Loader2, ArrowRight, User, Sparkles, Save, CheckCircle2 } from "lucide-react";
 import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
 import { CategoryCard } from "@/components/CategoryCard";
 import { ProgressIndicator } from "@/components/ProgressIndicator";
 import { AudioVisualizer } from "@/components/AudioVisualizer";
 import { ResultsDisplay } from "@/components/ResultsDisplay";
+import { VideoPreview } from "@/components/VideoPreview";
 import { useSpeechSynthesis } from "@/hooks/useSpeechSynthesis";
 import { useSpeechRecognition } from "@/hooks/useSpeechRecognition";
+import { useVideoRecording } from "@/hooks/useVideoRecording";
 import { supabase } from "@/integrations/supabase/client";
 import { toast } from "@/hooks/use-toast";
 
@@ -52,9 +54,28 @@ export const InterviewBot = () => {
   const [isLoading, setIsLoading] = useState(false);
   const [isSpeaking, setIsSpeaking] = useState(false);
   const [analysisResult, setAnalysisResult] = useState<AnalysisResult | null>(null);
+  const [isSaving, setIsSaving] = useState(false);
+  const [isSaved, setIsSaved] = useState(false);
 
   const { speak, cancel } = useSpeechSynthesis();
   const { isListening, transcript, startListening, stopListening } = useSpeechRecognition();
+  const {
+    isRecording: isVideoRecording,
+    isPaused,
+    recordedBlob,
+    recordedUrl,
+    stream,
+    videoRef,
+    playbackRef,
+    startCamera,
+    stopCamera,
+    startRecording: startVideoRecording,
+    stopRecording: stopVideoRecording,
+    pauseRecording,
+    resumeRecording,
+    clearRecording,
+    error: videoError,
+  } = useVideoRecording();
 
   const getStepNumber = () => {
     switch (step) {
@@ -75,6 +96,13 @@ export const InterviewBot = () => {
   const handleCategorySelect = async () => {
     if (!selectedCategory) return;
 
+    // Start camera automatically when entering interview
+    try {
+      await startCamera();
+    } catch (err) {
+      console.error("Camera start error:", err);
+    }
+
     setIsLoading(true);
     try {
       const { data, error } = await supabase.functions.invoke("interview-ai", {
@@ -89,8 +117,9 @@ export const InterviewBot = () => {
       setQuestions(data.questions);
       setStep("interview");
       
-      // Start the first question after a brief delay
+      // Start video recording and first question after a brief delay
       setTimeout(() => {
+        startVideoRecording();
         askQuestion(data.questions[0]);
       }, 1000);
     } catch (error) {
@@ -133,6 +162,8 @@ export const InterviewBot = () => {
           setCurrentQuestionIndex(nextIndex);
           setTimeout(() => askQuestion(questions[nextIndex]), 1500);
         } else {
+          // Stop video recording when interview is complete
+          stopVideoRecording();
           // Interview complete - analyze results
           analyzeInterview(updatedResponses);
         }
@@ -175,6 +206,59 @@ export const InterviewBot = () => {
     }
   };
 
+  const saveRecording = async () => {
+    if (!recordedBlob || !analysisResult) return;
+
+    setIsSaving(true);
+    try {
+      // Generate unique filename
+      const timestamp = new Date().toISOString().replace(/[:.]/g, "-");
+      const filename = `${candidateName.replace(/\s+/g, "-")}_${selectedCategory}_${timestamp}.webm`;
+
+      // Upload video to storage
+      const { data: uploadData, error: uploadError } = await supabase.storage
+        .from("interview-recordings")
+        .upload(filename, recordedBlob, {
+          contentType: "video/webm",
+          cacheControl: "3600",
+        });
+
+      if (uploadError) throw uploadError;
+
+      // Get the public URL
+      const { data: urlData } = supabase.storage
+        .from("interview-recordings")
+        .getPublicUrl(filename);
+
+      // Save metadata to database
+      const { error: dbError } = await supabase
+        .from("interview_recordings")
+        .insert([{
+          candidate_name: candidateName,
+          category: selectedCategory,
+          video_url: urlData.publicUrl,
+          analysis_result: JSON.parse(JSON.stringify(analysisResult)),
+        }]);
+
+      if (dbError) throw dbError;
+
+      setIsSaved(true);
+      toast({
+        title: "Recording Saved",
+        description: "Interview recording has been saved successfully for future verification.",
+      });
+    } catch (error) {
+      console.error("Save error:", error);
+      toast({
+        title: "Save Error",
+        description: "Failed to save the recording. Please try again.",
+        variant: "destructive",
+      });
+    } finally {
+      setIsSaving(false);
+    }
+  };
+
   const handleRestart = () => {
     setCandidateName("");
     setSelectedCategory(null);
@@ -182,8 +266,11 @@ export const InterviewBot = () => {
     setCurrentQuestionIndex(0);
     setResponses([]);
     setAnalysisResult(null);
+    setIsSaved(false);
     setStep("welcome");
     cancel();
+    stopCamera();
+    clearRecording();
   };
 
   // Load voices
@@ -194,6 +281,17 @@ export const InterviewBot = () => {
     loadVoices();
     window.speechSynthesis.onvoiceschanged = loadVoices;
   }, []);
+
+  // Show video error toast
+  useEffect(() => {
+    if (videoError) {
+      toast({
+        title: "Camera Error",
+        description: videoError,
+        variant: "destructive",
+      });
+    }
+  }, [videoError]);
 
   const pageVariants = {
     initial: { opacity: 0, y: 20 },
@@ -215,7 +313,7 @@ export const InterviewBot = () => {
           <motion.div
             initial={{ opacity: 0, y: -20 }}
             animate={{ opacity: 1, y: 0 }}
-            className="mb-12"
+            className="mb-8"
           >
             <ProgressIndicator
               currentStep={getStepNumber()}
@@ -250,9 +348,12 @@ export const InterviewBot = () => {
               <h1 className="text-5xl md:text-6xl font-bold mb-4">
                 <span className="gradient-text">AI Interview</span> Assistant
               </h1>
-              <p className="text-xl text-muted-foreground mb-12 max-w-lg">
+              <p className="text-xl text-muted-foreground mb-6 max-w-lg">
                 Experience a personalized technical interview powered by AI. 
                 Speak naturally and receive instant feedback.
+              </p>
+              <p className="text-sm text-muted-foreground mb-8 max-w-md">
+                📹 Your interview will be recorded (video + audio) for verification purposes.
               </p>
 
               <div className="w-full max-w-md space-y-6">
@@ -346,7 +447,7 @@ export const InterviewBot = () => {
               animate="animate"
               exit="exit"
               transition={{ duration: 0.4 }}
-              className="max-w-3xl mx-auto"
+              className="max-w-5xl mx-auto"
             >
               {isLoading ? (
                 <div className="flex flex-col items-center justify-center min-h-[60vh]">
@@ -354,107 +455,141 @@ export const InterviewBot = () => {
                   <p className="text-xl text-muted-foreground">Analyzing your responses...</p>
                 </div>
               ) : (
-                <div className="space-y-8">
-                  {/* AI Speaking Indicator */}
-                  <motion.div
-                    initial={{ scale: 0.9, opacity: 0 }}
-                    animate={{ scale: 1, opacity: 1 }}
-                    className="p-8 rounded-3xl bg-white/5 backdrop-blur-xl border border-white/10 text-center"
-                  >
-                    <div className="mb-6">
-                      {isSpeaking ? (
-                        <motion.div
-                          initial={{ scale: 0 }}
-                          animate={{ scale: 1 }}
-                          className="inline-flex items-center gap-3 px-4 py-2 rounded-full bg-primary/10 border border-primary/30"
-                        >
-                          <Volume2 className="w-5 h-5 text-primary" />
-                          <span className="text-primary font-medium">AI is speaking...</span>
-                        </motion.div>
-                      ) : isListening ? (
-                        <motion.div
-                          initial={{ scale: 0 }}
-                          animate={{ scale: 1 }}
-                          className="inline-flex items-center gap-3 px-4 py-2 rounded-full bg-accent/10 border border-accent/30"
-                        >
-                          <Mic className="w-5 h-5 text-accent" />
-                          <span className="text-accent font-medium">Listening to your answer...</span>
-                        </motion.div>
-                      ) : (
-                        <motion.div
-                          initial={{ scale: 0 }}
-                          animate={{ scale: 1 }}
-                          className="inline-flex items-center gap-3 px-4 py-2 rounded-full bg-muted border border-white/10"
-                        >
-                          <span className="text-muted-foreground">Ready for your response</span>
-                        </motion.div>
-                      )}
+                <div className="grid md:grid-cols-2 gap-6">
+                  {/* Video Preview Section */}
+                  <div>
+                    <h3 className="text-lg font-medium mb-4 text-center">Live Recording</h3>
+                    <div className="rounded-2xl overflow-hidden bg-secondary/50 border border-white/10">
+                      <div className="aspect-video relative">
+                        <video
+                          ref={videoRef}
+                          autoPlay
+                          playsInline
+                          muted
+                          className="w-full h-full object-cover"
+                        />
+                        {!stream && (
+                          <div className="absolute inset-0 flex flex-col items-center justify-center bg-secondary/80">
+                            <Loader2 className="w-8 h-8 animate-spin text-primary mb-2" />
+                            <p className="text-sm text-muted-foreground">Starting camera...</p>
+                          </div>
+                        )}
+                        {/* Recording indicator */}
+                        {isVideoRecording && (
+                          <motion.div
+                            initial={{ opacity: 0 }}
+                            animate={{ opacity: 1 }}
+                            className="absolute top-3 left-3 flex items-center gap-2 px-2 py-1 rounded-full bg-destructive/90"
+                          >
+                            <motion.div
+                              animate={{ opacity: [1, 0.3, 1] }}
+                              transition={{ repeat: Infinity, duration: 1 }}
+                              className="w-2 h-2 rounded-full bg-white"
+                            />
+                            <span className="text-xs text-white font-medium">REC</span>
+                          </motion.div>
+                        )}
+                      </div>
                     </div>
+                  </div>
 
-                    <AudioVisualizer isActive={isSpeaking || isListening} type={isSpeaking ? "speaking" : "listening"} />
+                  {/* Question & Answer Section */}
+                  <div className="space-y-6">
+                    <motion.div
+                      initial={{ scale: 0.9, opacity: 0 }}
+                      animate={{ scale: 1, opacity: 1 }}
+                      className="p-6 rounded-2xl bg-white/5 backdrop-blur-xl border border-white/10"
+                    >
+                      <div className="mb-4">
+                        {isSpeaking ? (
+                          <motion.div
+                            initial={{ scale: 0 }}
+                            animate={{ scale: 1 }}
+                            className="inline-flex items-center gap-2 px-3 py-1.5 rounded-full bg-primary/10 border border-primary/30"
+                          >
+                            <Volume2 className="w-4 h-4 text-primary" />
+                            <span className="text-sm text-primary font-medium">AI is speaking...</span>
+                          </motion.div>
+                        ) : isListening ? (
+                          <motion.div
+                            initial={{ scale: 0 }}
+                            animate={{ scale: 1 }}
+                            className="inline-flex items-center gap-2 px-3 py-1.5 rounded-full bg-accent/10 border border-accent/30"
+                          >
+                            <Mic className="w-4 h-4 text-accent" />
+                            <span className="text-sm text-accent font-medium">Listening...</span>
+                          </motion.div>
+                        ) : (
+                          <div className="inline-flex items-center gap-2 px-3 py-1.5 rounded-full bg-muted border border-white/10">
+                            <span className="text-sm text-muted-foreground">Ready for your response</span>
+                          </div>
+                        )}
+                      </div>
 
-                    <div className="mt-8 mb-6">
-                      <p className="text-sm text-muted-foreground mb-2">Question {currentQuestionIndex + 1}</p>
-                      <h3 className="text-2xl font-medium">{questions[currentQuestionIndex]}</h3>
-                    </div>
+                      <AudioVisualizer isActive={isSpeaking || isListening} type={isSpeaking ? "speaking" : "listening"} />
 
-                    {transcript && (
-                      <motion.div
-                        initial={{ opacity: 0, y: 10 }}
-                        animate={{ opacity: 1, y: 0 }}
-                        className="p-4 rounded-xl bg-secondary/50 border border-white/5 text-left mb-6"
-                      >
-                        <p className="text-sm text-muted-foreground mb-1">Your answer:</p>
-                        <p className="text-foreground/90 italic">"{transcript}"</p>
-                      </motion.div>
-                    )}
+                      <div className="mt-6 mb-4">
+                        <p className="text-xs text-muted-foreground mb-1">Question {currentQuestionIndex + 1} of {questions.length}</p>
+                        <h3 className="text-lg font-medium">{questions[currentQuestionIndex]}</h3>
+                      </div>
 
-                    <div className="flex justify-center gap-4">
-                      {!isSpeaking && (
-                        <>
-                          {isListening ? (
-                            <Button
-                              onClick={stopListening}
-                              variant="glass"
-                              size="xl"
-                              className="border-accent/30 hover:bg-accent/20"
-                            >
-                              <MicOff className="w-6 h-6 mr-2" />
-                              Stop Recording
-                            </Button>
-                          ) : (
-                            <Button
-                              onClick={handleStartRecording}
-                              variant="gradient"
-                              size="xl"
-                            >
-                              <Mic className="w-6 h-6 mr-2" />
-                              Start Recording
-                            </Button>
-                          )}
-                        </>
-                      )}
-                    </div>
-                  </motion.div>
-
-                  {/* Previous Responses */}
-                  {responses.length > 0 && (
-                    <div className="space-y-4">
-                      <h4 className="text-lg font-medium text-muted-foreground">Previous Answers</h4>
-                      {responses.map((response, i) => (
+                      {transcript && (
                         <motion.div
-                          key={i}
                           initial={{ opacity: 0, y: 10 }}
                           animate={{ opacity: 1, y: 0 }}
-                          transition={{ delay: i * 0.1 }}
-                          className="p-4 rounded-xl bg-white/5 border border-white/5"
+                          className="p-3 rounded-xl bg-secondary/50 border border-white/5 mb-4"
                         >
-                          <p className="text-sm text-muted-foreground mb-1">Q{i + 1}: {response.question}</p>
-                          <p className="text-foreground/80 italic">"{response.answer}"</p>
+                          <p className="text-xs text-muted-foreground mb-1">Your answer:</p>
+                          <p className="text-sm text-foreground/90 italic">"{transcript}"</p>
                         </motion.div>
-                      ))}
-                    </div>
-                  )}
+                      )}
+
+                      <div className="flex justify-center">
+                        {!isSpeaking && (
+                          <>
+                            {isListening ? (
+                              <Button
+                                onClick={stopListening}
+                                variant="glass"
+                                size="lg"
+                                className="border-accent/30 hover:bg-accent/20"
+                              >
+                                <MicOff className="w-5 h-5 mr-2" />
+                                Stop Recording
+                              </Button>
+                            ) : (
+                              <Button
+                                onClick={handleStartRecording}
+                                variant="gradient"
+                                size="lg"
+                              >
+                                <Mic className="w-5 h-5 mr-2" />
+                                Answer
+                              </Button>
+                            )}
+                          </>
+                        )}
+                      </div>
+                    </motion.div>
+
+                    {/* Previous Responses - Compact */}
+                    {responses.length > 0 && (
+                      <div className="space-y-2 max-h-48 overflow-y-auto">
+                        <h4 className="text-sm font-medium text-muted-foreground">Previous Answers</h4>
+                        {responses.map((response, i) => (
+                          <motion.div
+                            key={i}
+                            initial={{ opacity: 0 }}
+                            animate={{ opacity: 1 }}
+                            className="p-3 rounded-lg bg-white/5 border border-white/5"
+                          >
+                            <p className="text-xs text-muted-foreground">Q{i + 1}: {response.question}</p>
+                            <p className="text-sm text-foreground/70 italic truncate">"{response.answer}"</p>
+                          </motion.div>
+                        ))}
+                      </div>
+                    )}
+                  </div>
                 </div>
               )}
             </motion.div>
@@ -469,7 +604,54 @@ export const InterviewBot = () => {
               animate="animate"
               exit="exit"
               transition={{ duration: 0.4 }}
+              className="max-w-5xl mx-auto"
             >
+              {/* Video Playback Section */}
+              {recordedUrl && (
+                <motion.div
+                  initial={{ opacity: 0, y: 20 }}
+                  animate={{ opacity: 1, y: 0 }}
+                  className="mb-8"
+                >
+                  <h3 className="text-xl font-semibold mb-4 text-center">Interview Recording</h3>
+                  <div className="max-w-2xl mx-auto">
+                    <div className="rounded-2xl overflow-hidden bg-secondary/50 border border-white/10">
+                      <video
+                        ref={playbackRef}
+                        src={recordedUrl}
+                        controls
+                        className="w-full aspect-video object-cover"
+                      />
+                      <div className="p-4 flex justify-center gap-4">
+                        <Button
+                          onClick={saveRecording}
+                          disabled={isSaving || isSaved}
+                          variant={isSaved ? "glass" : "gradient"}
+                          size="lg"
+                        >
+                          {isSaving ? (
+                            <>
+                              <Loader2 className="w-5 h-5 mr-2 animate-spin" />
+                              Saving...
+                            </>
+                          ) : isSaved ? (
+                            <>
+                              <CheckCircle2 className="w-5 h-5 mr-2" />
+                              Saved
+                            </>
+                          ) : (
+                            <>
+                              <Save className="w-5 h-5 mr-2" />
+                              Save Recording
+                            </>
+                          )}
+                        </Button>
+                      </div>
+                    </div>
+                  </div>
+                </motion.div>
+              )}
+
               <ResultsDisplay
                 candidateName={candidateName}
                 category={selectedCategory || ""}
