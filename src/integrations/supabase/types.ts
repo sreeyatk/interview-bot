@@ -14,36 +14,7 @@ export type Database = {
   }
   public: {
     Tables: {
-      interview_recordings: {
-        Row: {
-          analysis_result: Json | null
-          candidate_name: string
-          category: string
-          created_at: string
-          id: string
-          updated_at: string
-          video_url: string | null
-        }
-        Insert: {
-          analysis_result?: Json | null
-          candidate_name: string
-          category: string
-          created_at?: string
-          id?: string
-          updated_at?: string
-          video_url?: string | null
-        }
-        Update: {
-          analysis_result?: Json | null
-          candidate_name?: string
-          category?: string
-          created_at?: string
-          id?: string
-          updated_at?: string
-          video_url?: string | null
-        }
-        Relationships: []
-      }
+      [_ in never]: never
     }
     Views: {
       [_ in never]: never

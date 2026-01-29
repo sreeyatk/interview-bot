@@ -2,184 +2,172 @@ import { useState, useRef, useCallback, useEffect } from "react";
 
 interface UseVideoRecordingReturn {
   isRecording: boolean;
-  isPaused: boolean;
-  recordedBlob: Blob | null;
-  recordedUrl: string | null;
-  stream: MediaStream | null;
+  isPreviewing: boolean;
   videoRef: React.RefObject<HTMLVideoElement>;
-  playbackRef: React.RefObject<HTMLVideoElement>;
-  startCamera: () => Promise<void>;
-  stopCamera: () => void;
+  recordedChunks: Blob[];
+  recordingUrl: string | null;
+  startPreview: () => Promise<void>;
+  stopPreview: () => void;
   startRecording: () => void;
-  stopRecording: () => void;
-  pauseRecording: () => void;
-  resumeRecording: () => void;
-  clearRecording: () => void;
+  stopRecording: () => Promise<Blob | null>;
+  resetRecording: () => void;
   error: string | null;
 }
 
 export const useVideoRecording = (): UseVideoRecordingReturn => {
   const [isRecording, setIsRecording] = useState(false);
-  const [isPaused, setIsPaused] = useState(false);
-  const [recordedBlob, setRecordedBlob] = useState<Blob | null>(null);
-  const [recordedUrl, setRecordedUrl] = useState<string | null>(null);
-  const [stream, setStream] = useState<MediaStream | null>(null);
+  const [isPreviewing, setIsPreviewing] = useState(false);
+  const [recordedChunks, setRecordedChunks] = useState<Blob[]>([]);
+  const [recordingUrl, setRecordingUrl] = useState<string | null>(null);
   const [error, setError] = useState<string | null>(null);
 
   const videoRef = useRef<HTMLVideoElement>(null);
-  const playbackRef = useRef<HTMLVideoElement>(null);
   const mediaRecorderRef = useRef<MediaRecorder | null>(null);
+  const streamRef = useRef<MediaStream | null>(null);
   const chunksRef = useRef<Blob[]>([]);
 
-  // Start camera and microphone
-  const startCamera = useCallback(async () => {
+  const startPreview = useCallback(async () => {
     try {
       setError(null);
-      const mediaStream = await navigator.mediaDevices.getUserMedia({
+      const stream = await navigator.mediaDevices.getUserMedia({
         video: {
           width: { ideal: 1280 },
           height: { ideal: 720 },
           facingMode: "user",
         },
-        audio: {
-          echoCancellation: true,
-          noiseSuppression: true,
-          sampleRate: 44100,
-        },
+        audio: true,
       });
 
-      setStream(mediaStream);
-
+      streamRef.current = stream;
+      
       if (videoRef.current) {
-        videoRef.current.srcObject = mediaStream;
-        videoRef.current.muted = true;
+        videoRef.current.srcObject = stream;
+        videoRef.current.muted = true; // Prevent echo
         await videoRef.current.play();
       }
+
+      setIsPreviewing(true);
     } catch (err) {
-      const errorMessage = err instanceof Error ? err.message : "Failed to access camera";
-      setError(errorMessage);
+      const message = err instanceof Error ? err.message : "Failed to access camera";
+      setError(message);
       console.error("Camera access error:", err);
     }
   }, []);
 
-  // Stop camera
-  const stopCamera = useCallback(() => {
-    if (stream) {
-      stream.getTracks().forEach((track) => track.stop());
-      setStream(null);
+  const stopPreview = useCallback(() => {
+    if (streamRef.current) {
+      streamRef.current.getTracks().forEach((track) => track.stop());
+      streamRef.current = null;
     }
+    
     if (videoRef.current) {
       videoRef.current.srcObject = null;
     }
-  }, [stream]);
+    
+    setIsPreviewing(false);
+  }, []);
 
-  // Start recording
   const startRecording = useCallback(() => {
-    if (!stream) {
-      setError("Camera not started");
+    if (!streamRef.current) {
+      setError("No media stream available");
       return;
     }
 
-    chunksRef.current = [];
-    setRecordedBlob(null);
-    setRecordedUrl(null);
+    try {
+      chunksRef.current = [];
+      setRecordedChunks([]);
+      
+      const mimeType = MediaRecorder.isTypeSupported("video/webm;codecs=vp9")
+        ? "video/webm;codecs=vp9"
+        : MediaRecorder.isTypeSupported("video/webm")
+        ? "video/webm"
+        : "video/mp4";
 
-    // Use supported MIME type
-    const mimeType = MediaRecorder.isTypeSupported("video/webm;codecs=vp9,opus")
-      ? "video/webm;codecs=vp9,opus"
-      : MediaRecorder.isTypeSupported("video/webm;codecs=vp8,opus")
-      ? "video/webm;codecs=vp8,opus"
-      : "video/webm";
+      const mediaRecorder = new MediaRecorder(streamRef.current, {
+        mimeType,
+        videoBitsPerSecond: 2500000,
+      });
 
-    const mediaRecorder = new MediaRecorder(stream, {
-      mimeType,
-      videoBitsPerSecond: 2500000,
-    });
+      mediaRecorder.ondataavailable = (event) => {
+        if (event.data && event.data.size > 0) {
+          chunksRef.current.push(event.data);
+        }
+      };
 
-    mediaRecorder.ondataavailable = (event) => {
-      if (event.data.size > 0) {
-        chunksRef.current.push(event.data);
+      mediaRecorder.onerror = (event) => {
+        console.error("MediaRecorder error:", event);
+        setError("Recording error occurred");
+      };
+
+      mediaRecorderRef.current = mediaRecorder;
+      mediaRecorder.start(1000); // Collect data every second
+      setIsRecording(true);
+    } catch (err) {
+      const message = err instanceof Error ? err.message : "Failed to start recording";
+      setError(message);
+      console.error("Recording start error:", err);
+    }
+  }, []);
+
+  const stopRecording = useCallback(async (): Promise<Blob | null> => {
+    return new Promise((resolve) => {
+      if (!mediaRecorderRef.current || mediaRecorderRef.current.state === "inactive") {
+        setIsRecording(false);
+        resolve(null);
+        return;
       }
-    };
 
-    mediaRecorder.onstop = () => {
-      const blob = new Blob(chunksRef.current, { type: mimeType });
-      setRecordedBlob(blob);
-      const url = URL.createObjectURL(blob);
-      setRecordedUrl(url);
-    };
+      mediaRecorderRef.current.onstop = () => {
+        const chunks = chunksRef.current;
+        setRecordedChunks(chunks);
+        
+        if (chunks.length > 0) {
+          const blob = new Blob(chunks, { type: chunks[0].type });
+          const url = URL.createObjectURL(blob);
+          setRecordingUrl(url);
+          resolve(blob);
+        } else {
+          resolve(null);
+        }
+        
+        setIsRecording(false);
+      };
 
-    mediaRecorder.onerror = (event) => {
-      console.error("MediaRecorder error:", event);
-      setError("Recording error occurred");
-    };
-
-    mediaRecorderRef.current = mediaRecorder;
-    mediaRecorder.start(1000); // Collect data every second
-    setIsRecording(true);
-    setIsPaused(false);
-  }, [stream]);
-
-  // Stop recording
-  const stopRecording = useCallback(() => {
-    if (mediaRecorderRef.current && mediaRecorderRef.current.state !== "inactive") {
       mediaRecorderRef.current.stop();
-      setIsRecording(false);
-      setIsPaused(false);
-    }
+    });
   }, []);
 
-  // Pause recording
-  const pauseRecording = useCallback(() => {
-    if (mediaRecorderRef.current && mediaRecorderRef.current.state === "recording") {
-      mediaRecorderRef.current.pause();
-      setIsPaused(true);
+  const resetRecording = useCallback(() => {
+    if (recordingUrl) {
+      URL.revokeObjectURL(recordingUrl);
     }
-  }, []);
-
-  // Resume recording
-  const resumeRecording = useCallback(() => {
-    if (mediaRecorderRef.current && mediaRecorderRef.current.state === "paused") {
-      mediaRecorderRef.current.resume();
-      setIsPaused(false);
-    }
-  }, []);
-
-  // Clear recording
-  const clearRecording = useCallback(() => {
-    if (recordedUrl) {
-      URL.revokeObjectURL(recordedUrl);
-    }
-    setRecordedBlob(null);
-    setRecordedUrl(null);
     chunksRef.current = [];
-  }, [recordedUrl]);
+    setRecordedChunks([]);
+    setRecordingUrl(null);
+    setError(null);
+  }, [recordingUrl]);
 
   // Cleanup on unmount
   useEffect(() => {
     return () => {
-      stopCamera();
-      if (recordedUrl) {
-        URL.revokeObjectURL(recordedUrl);
+      stopPreview();
+      if (recordingUrl) {
+        URL.revokeObjectURL(recordingUrl);
       }
     };
-  }, []);
+  }, [stopPreview, recordingUrl]);
 
   return {
     isRecording,
-    isPaused,
-    recordedBlob,
-    recordedUrl,
-    stream,
+    isPreviewing,
     videoRef,
-    playbackRef,
-    startCamera,
-    stopCamera,
+    recordedChunks,
+    recordingUrl,
+    startPreview,
+    stopPreview,
     startRecording,
     stopRecording,
-    pauseRecording,
-    resumeRecording,
-    clearRecording,
+    resetRecording,
     error,
   };
 };
