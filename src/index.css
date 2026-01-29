@@ -132,6 +132,10 @@
   .text-balance {
     text-wrap: balance;
   }
+
+  .mirror-video {
+    transform: scaleX(-1);
+  }
 }
 
 @keyframes pulse-ring {

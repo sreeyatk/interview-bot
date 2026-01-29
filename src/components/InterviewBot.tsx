@@ -1,14 +1,16 @@
 import { useState, useEffect, useCallback } from "react";
 import { motion, AnimatePresence } from "framer-motion";
-import { Mic, MicOff, Volume2, Loader2, ArrowRight, User, Sparkles } from "lucide-react";
+import { Mic, MicOff, Volume2, Loader2, ArrowRight, User, Sparkles, Video, VideoOff } from "lucide-react";
 import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
 import { CategoryCard } from "@/components/CategoryCard";
 import { ProgressIndicator } from "@/components/ProgressIndicator";
 import { AudioVisualizer } from "@/components/AudioVisualizer";
 import { ResultsDisplay } from "@/components/ResultsDisplay";
+import { VideoPreview } from "@/components/VideoPreview";
 import { useSpeechSynthesis } from "@/hooks/useSpeechSynthesis";
 import { useSpeechRecognition } from "@/hooks/useSpeechRecognition";
+import { useVideoRecording } from "@/hooks/useVideoRecording";
 import { supabase } from "@/integrations/supabase/client";
 import { toast } from "@/hooks/use-toast";
 
@@ -55,6 +57,18 @@ export const InterviewBot = () => {
 
   const { speak, cancel } = useSpeechSynthesis();
   const { isListening, transcript, startListening, stopListening } = useSpeechRecognition();
+  const { 
+    isRecording: isVideoRecording, 
+    isPreviewing, 
+    videoRef, 
+    recordingUrl,
+    startPreview, 
+    stopPreview, 
+    startRecording: startVideoRecording, 
+    stopRecording: stopVideoRecording,
+    resetRecording,
+    error: videoError 
+  } = useVideoRecording();
 
   const getStepNumber = () => {
     switch (step) {
@@ -77,6 +91,9 @@ export const InterviewBot = () => {
 
     setIsLoading(true);
     try {
+      // Start camera preview and recording
+      await startPreview();
+      
       const { data, error } = await supabase.functions.invoke("interview-ai", {
         body: {
           action: "generate-questions",
@@ -88,6 +105,9 @@ export const InterviewBot = () => {
 
       setQuestions(data.questions);
       setStep("interview");
+      
+      // Start video recording
+      startVideoRecording();
       
       // Start the first question after a brief delay
       setTimeout(() => {
@@ -149,6 +169,13 @@ export const InterviewBot = () => {
 
   const analyzeInterview = async (allResponses: InterviewResponse[]) => {
     setIsLoading(true);
+    
+    // Stop video recording
+    const videoBlob = await stopVideoRecording();
+    if (videoBlob) {
+      console.log("Interview video recorded:", videoBlob.size, "bytes");
+    }
+    
     try {
       const { data, error } = await supabase.functions.invoke("interview-ai", {
         body: {
@@ -184,6 +211,8 @@ export const InterviewBot = () => {
     setAnalysisResult(null);
     setStep("welcome");
     cancel();
+    stopPreview();
+    resetRecording();
   };
 
   // Load voices
@@ -355,6 +384,16 @@ export const InterviewBot = () => {
                 </div>
               ) : (
                 <div className="space-y-8">
+                  {/* Video Preview */}
+                  <div className="flex justify-center">
+                    <VideoPreview
+                      ref={videoRef}
+                      isPreviewing={isPreviewing}
+                      isRecording={isVideoRecording}
+                      error={videoError}
+                    />
+                  </div>
+
                   {/* AI Speaking Indicator */}
                   <motion.div
                     initial={{ scale: 0.9, opacity: 0 }}
